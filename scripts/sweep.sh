@@ -10,7 +10,7 @@
 # Measures how runtime scales with one parameter, for the evidence pack's
 # "how do input factors / CUDA parameters affect runtime" questions. Each value
 # replaces {} in the template. Template tokens of the form NAME=... are exported
-# as environment variables (the PT_* tuning knobs in versions/common.cuh);
+# as environment variables (the PT_* tuning knobs read by v3 and later);
 # all other tokens are passed to the executable as flags.
 #
 # If the template has no -- flags, the render settings are unchanged, so every run
