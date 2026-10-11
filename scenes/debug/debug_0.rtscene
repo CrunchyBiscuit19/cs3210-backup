@@ -1,0 +1,15 @@
+render 256 256
+samples_per_pixel 10000
+supersampling_factor 1
+max_bounces 1
+screen 3.2 3.2
+camera 0 0 -4
+background 0 0 0
+
+albedo 0.9 0.2 0.1
+emission 0.9 0.2 0.1
+o triangle
+v -1.2 -1 0
+v 1.2 -1 0
+v 0 1.2 0
+f 1 2 3

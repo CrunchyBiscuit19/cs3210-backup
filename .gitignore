@@ -1,0 +1,11 @@
+# Build outputs
+path_tracing
+cpu_path_tracing
+output.ppm
+
+# sbatch logs and bulky job outputs (CSV results stay tracked for the evidence pack)
+logs/*
+!logs/.gitkeep
+results/**/*.ppm
+results/profile/
+build/
