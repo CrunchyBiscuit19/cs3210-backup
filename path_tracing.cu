@@ -1,448 +1,326 @@
-// v4 coherence: v3 with less warp divergence.
-//
-// - Path regeneration: the nested sample/bounce loops become a single loop in which
-//   each iteration is one closest-hit query. When a lane's path ends (miss, max bounces
-//   or black throughput) it starts its next sample straight away, instead of idling
-//   until the longest path in its warp finishes.
-// - Warp tiling: each warp traces an 8x4 block of pixels rather than 32 pixels of one
-//   row, so the rays in a warp are closer together and tend to visit the same objects.
-//
-// Work split, RNG, accumulation, finalisation and per-ray code are the same as v3.
+// v4: v3 + less warp divergence.
+// - Path regeneration: one loop iteration per ray instead of nested sample and bounce
+//   loops. When a thread's path ends it starts its next path straight away, instead of
+//   waiting for the longest path in its warp to finish.
+// - Each warp traces an 8x4 tile of pixels instead of 32 pixels of one row, so the rays
+//   in a warp are closer together and tend to hit the same objects.
+// PT_BLOCK_SIZE and PT_SAMPLES_PER_THREAD override the defaults (for parameter sweeps).
+// PT_BLOCK_SIZE should be a multiple of 32 so that every warp covers exactly one tile.
 
-#include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "graphics.cuh"
 #include "geometry.cuh"
 
-// main.cu catches std::exception and prints what(), so CUDA failures are reported cleanly.
-#define CUDA_CHECK(call)                                                                   \
-    do {                                                                                   \
-        const cudaError_t cuda_error_ = (call);                                            \
-        if (cuda_error_ != cudaSuccess) {                                                  \
-            throw std::runtime_error(std::string(#call) + " failed at " + __FILE__ + ":" + \
-                                     std::to_string(__LINE__) + ": " +                     \
-                                     cudaGetErrorString(cuda_error_));                     \
-        }                                                                                  \
-    } while (0)
+#define MAX_OBJECTS 128
+#define MAX_BLOCK_SIZE 512
+#define TILE_WIDTH 8
+#define TILE_HEIGHT 4
 
-constexpr int kMaxObjects = 128;  // brief: the number of objects does not exceed 128
-
-struct alignas(16) TriangleGPU {
+struct GPUTriangle {
     float4 p0;  // xyz = first vertex
     float4 e1;  // xyz = p1 - p0
     float4 e2;  // xyz = p2 - p0
 };
 
-struct alignas(16) ObjectGPU {
-    float4 sphere;  // xyz = bounding sphere center, w = radius^2
+// The triangles of all objects are stored in one array, object by object.
+// Object i owns triangles [tri_begin, tri_end).
+struct GPUObject {
+    float4 sphere;  // xyz = bounding sphere center, w = radius squared
     int tri_begin;
     int tri_end;
-    int padding[2];
 };
 
-struct alignas(16) MaterialGPU {
-    float4 albedo;    // xyz
-    float4 emission;  // xyz
+struct GPUMaterial {
+    float4 albedo;
+    float4 emission;
 };
 
-__constant__ ObjectGPU c_objects[kMaxObjects];
-
-namespace {
-
-constexpr int kDefaultBlockSize = 128;
-constexpr int kMaxBlockSize = 512;
-constexpr int kWarpSize = 32;
-constexpr int kTileWidth = 8;
-constexpr int kTileHeight = kWarpSize / kTileWidth;
-
-// Copies a host vector into a new device allocation (nullptr when empty).
-template <typename T>
-T* to_device(const std::vector<T>& host) {
-    T* device = nullptr;
-    if (!host.empty()) {
-        CUDA_CHECK(cudaMalloc(&device, host.size() * sizeof(T)));
-        CUDA_CHECK(cudaMemcpy(device, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
-    }
-    return device;
-}
-
-// Positive integer tuning override from the environment (e.g. PT_BLOCK_SIZE=256),
-// used for parameter sweeps. Unset or invalid values fall back to the default.
-int getenv_int(const char* name, int fallback) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0') return fallback;
-    char* end = nullptr;
-    const long parsed = std::strtol(value, &end, 10);
-    if (*end != '\0' || parsed <= 0 || parsed > INT32_MAX) return fallback;
-    return int(parsed);
-}
-
-// How the paths of each pixel are split across threads.
-struct LaunchShape {
-    int block_size;
-    int samples_per_thread;  // consecutive paths traced by one thread
-    int chunks;              // threads per pixel = ceil(paths_per_pixel / samples_per_thread)
+struct Hit {
+    float t;
+    int triangle;  // -1 if nothing was hit
+    int object;
 };
 
-// Splits each pixel's paths into chunks so the grid holds about kTargetWaves times as many
-// threads as the GPU can keep resident. That fills the GPU even for small images (ufo has only
-// 60k pixels) and keeps the final partial wave short. PT_BLOCK_SIZE and PT_SAMPLES_PER_THREAD
-// override the defaults; PT_VERBOSE=1 prints the chosen shape.
-LaunchShape choose_launch_shape(long long threads_per_chunk, int paths_per_pixel) {
-    constexpr long long kTargetWaves = 4;
+// PCG32 random number generator (pcg-random.org). Each thread uses its own stream.
+struct Pcg32 {
+    uint64_t state;
+    uint64_t inc;
 
-    int device = 0;
-    int sm_count = 0;
-    int threads_per_sm = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device));
-
-    LaunchShape shape;
-    const int requested_block = getenv_int("PT_BLOCK_SIZE", kDefaultBlockSize);
-    shape.block_size = std::min(kMaxBlockSize, std::max(32, requested_block / 32 * 32));
-
-    const long long target_threads = kTargetWaves * sm_count * threads_per_sm;
-    long long chunks = (target_threads + threads_per_chunk - 1) / threads_per_chunk;
-    chunks = std::max(1LL, std::min<long long>(chunks, paths_per_pixel));
-    const int default_samples = int((paths_per_pixel + chunks - 1) / chunks);
-    shape.samples_per_thread =
-        std::min(paths_per_pixel, getenv_int("PT_SAMPLES_PER_THREAD", default_samples));
-    shape.chunks = (paths_per_pixel + shape.samples_per_thread - 1) / shape.samples_per_thread;
-
-    if (getenv_int("PT_VERBOSE", 0) > 0) {
-        std::fprintf(stderr,
-                     "launch: %d SMs x %d threads/SM, block %d, %d samples/thread, %d chunks/pixel, "
-                     "%lld threads\n",
-                     sm_count, threads_per_sm, shape.block_size, shape.samples_per_thread,
-                     shape.chunks, threads_per_chunk * shape.chunks);
-    }
-    return shape;
-}
-
-// 64-bit mixer (splitmix64 finalizer) for seeding per-thread generators.
-__host__ __device__ inline std::uint64_t mix64(std::uint64_t x) {
-    x += 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
-}
-
-// PCG32 (O'Neill, pcg-random.org): 16 bytes of state versus 48 for curand's XORWOW, and no
-// curand_init. Each thread gets its own stream.
-class Pcg32 {
-public:
-    __device__ Pcg32(std::uint64_t seed, std::uint64_t stream) : state_(0), increment_((stream << 1) | 1) {
+    __device__ Pcg32(uint64_t seed, uint64_t stream) {
+        state = 0;
+        inc = (stream << 1) | 1;
         next();
-        state_ += seed;
+        state += seed;
         next();
     }
 
-    __device__ __forceinline__ std::uint32_t next() {
-        const std::uint64_t old = state_;
-        state_ = old * 6364136223846793005ULL + increment_;
-        const std::uint32_t xorshifted = std::uint32_t(((old >> 18) ^ old) >> 27);
-        const std::uint32_t rotation = std::uint32_t(old >> 59);
-        return (xorshifted >> rotation) | (xorshifted << ((32 - rotation) & 31));
+    __device__ uint32_t next() {
+        uint64_t old = state;
+        state = old * 6364136223846793005ULL + inc;
+        uint32_t xorshifted = ((old >> 18) ^ old) >> 27;
+        uint32_t rot = old >> 59;
+        return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
     }
 
-    // Uniform float in [0, 1) from the top 24 bits.
-    __device__ __forceinline__ float uniform() {
-        return float(next() >> 8) * (1.0f / 16777216.0f);
+    // Uniform float in [0, 1).
+    __device__ float uniform() {
+        return (next() >> 8) * (1.0f / 16777216.0f);
     }
-
-private:
-    std::uint64_t state_;
-    std::uint64_t increment_;
 };
 
-__device__ __forceinline__ Vec3 xyz(const float4& v) {
+__constant__ GPUObject c_objects[MAX_OBJECTS];
+
+__device__ Vec3 to_vec3(float4 v) {
     return Vec3(v.x, v.y, v.z);
 }
 
-__device__ __forceinline__ bool is_black(const Vec3& v) {
-    return v.x == 0.0f && v.y == 0.0f && v.z == 0.0f;
-}
-
-// Distance at which the ray enters the sphere (0 if it starts inside), or INF if it misses.
-// Hits exactly when geometry.cuh's intersect_sphere returns true (far root > EPSILON).
-__device__ __forceinline__ float sphere_entry(const Vec3& origin, const Vec3& direction, const float4& sphere) {
-    const Vec3 offset = origin - xyz(sphere);
-    const float half_b = dot(offset, direction);
-    const float c = dot(offset, offset) - sphere.w;
-    const float discriminant = half_b * half_b - c;
+// Distance to where the ray enters the sphere (0 if it starts inside), or INF if it misses.
+__device__ float sphere_entry(Vec3 origin, Vec3 direction, float4 sphere) {
+    Vec3 offset = origin - to_vec3(sphere);
+    float half_b = dot(offset, direction);
+    float c = dot(offset, offset) - sphere.w;
+    float discriminant = half_b * half_b - c;
     if (discriminant < 0.0f) return INF;
 
-    const float root = sqrtf(discriminant);
+    float root = sqrtf(discriminant);
     if (-half_b + root <= EPSILON) return INF;
     return fmaxf(-half_b - root, 0.0f);
 }
 
-// Moller-Trumbore with the same tests as geometry.cuh's intersect_triangle, returning only t
-// (INF on a miss).
-__device__ __forceinline__ float intersect_triangle_t(
-    const Vec3& origin,
-    const Vec3& direction,
-    const TriangleGPU* __restrict__ triangle
-) {
-    const Vec3 p0 = xyz(__ldg(&triangle->p0));
-    const Vec3 e1 = xyz(__ldg(&triangle->e1));
-    const Vec3 e2 = xyz(__ldg(&triangle->e2));
+// Same test as intersect_triangle in geometry.cuh, but only returns t (INF if no hit).
+__device__ float intersect_triangle_t(Vec3 origin, Vec3 direction, const GPUTriangle& triangle) {
+    Vec3 e1 = to_vec3(triangle.e1);
+    Vec3 e2 = to_vec3(triangle.e2);
+    Vec3 p = cross(direction, e2);
+    float det = dot(e1, p);
+    if (fabsf(det) <= EPSILON) return INF;
 
-    const Vec3 p = cross(direction, e2);
-    const float determinant = dot(e1, p);
-    if (fabsf(determinant) <= EPSILON) return INF;
-
-    const float inverse_determinant = __fdividef(1.0f, determinant);
-    const Vec3 offset = origin - p0;
-    const float u = dot(offset, p) * inverse_determinant;
+    float inv_det = 1.0f / det;
+    Vec3 offset = origin - to_vec3(triangle.p0);
+    float u = dot(offset, p) * inv_det;
     if (u < 0.0f || u > 1.0f) return INF;
 
-    const Vec3 q = cross(offset, e1);
-    const float v = dot(direction, q) * inverse_determinant;
+    Vec3 q = cross(offset, e1);
+    float v = dot(direction, q) * inv_det;
     if (v < 0.0f || u + v > 1.0f) return INF;
 
-    const float t = dot(e2, q) * inverse_determinant;
+    float t = dot(e2, q) * inv_det;
     return t > EPSILON ? t : INF;
 }
 
-// Unit normal of the triangle, flipped to face against the incoming ray (as geometry.cuh does).
-__device__ __forceinline__ Vec3 facing_normal(const TriangleGPU* __restrict__ triangle, const Vec3& direction) {
-    const Vec3 normal = cross(xyz(__ldg(&triangle->e1)), xyz(__ldg(&triangle->e2)));
-    const Vec3 unit = normal * rsqrtf(dot(normal, normal));
-    return dot(unit, direction) > 0.0f ? -unit : unit;
+// Unit normal of the triangle, facing against the ray (as in intersect_triangle).
+__device__ Vec3 triangle_normal(const GPUTriangle& triangle, Vec3 direction) {
+    Vec3 normal = normalize(cross(to_vec3(triangle.e1), to_vec3(triangle.e2)));
+    if (dot(normal, direction) > 0.0f) normal = -normal;
+    return normal;
 }
 
-struct HitInfo {
-    float t;
-    int triangle;  // -1 on a miss
-    int object;
-};
+// Same as cosine_weighted_sampling in geometry.cuh, in single precision.
+__device__ Vec3 sample_direction(Vec3 normal, Pcg32& random) {
+    float z = 1.0f - 2.0f * random.uniform();
+    float angle = 2.0f * PI * random.uniform();
+    float radius = sqrtf(1.0f - z * z);
+    float sin_angle, cos_angle;
+    sincosf(angle, &sin_angle, &cos_angle);
 
-// Closest hit over the whole scene, skipping `last_hit` (brief, recommendation 4). An object is
-// skipped when the ray misses its bounding sphere or enters it beyond the closest hit so far.
-__device__ __forceinline__ HitInfo find_closest_hit(
-    const Vec3& origin,
-    const Vec3& direction,
-    const TriangleGPU* __restrict__ triangles,
-    int n_objects,
-    int last_hit
-) {
-    HitInfo closest{INF, -1, -1};
-    for (int object = 0; object < n_objects; ++object) {
-        if (sphere_entry(origin, direction, c_objects[object].sphere) >= closest.t) continue;
+    Vec3 direction = normal + Vec3(radius * cos_angle, radius * sin_angle, z);
+    if (dot(direction, direction) < EPSILON * EPSILON) return normal;
+    return normalize(direction);
+}
 
-        const int end = c_objects[object].tri_end;
-        for (int i = c_objects[object].tri_begin; i < end; ++i) {
+__device__ Hit find_closest_hit(Vec3 origin, Vec3 direction, const GPUTriangle* triangles,
+                                int num_objects, int last_hit) {
+    Hit closest = {INF, -1, -1};
+
+    for (int o = 0; o < num_objects; o++) {
+        // Skip the object if the ray misses its bounding sphere, or only reaches it
+        // further away than the closest hit so far.
+        if (sphere_entry(origin, direction, c_objects[o].sphere) >= closest.t) continue;
+
+        for (int i = c_objects[o].tri_begin; i < c_objects[o].tri_end; i++) {
             if (i == last_hit) continue;
-            const float t = intersect_triangle_t(origin, direction, triangles + i);
+            float t = intersect_triangle_t(origin, direction, triangles[i]);
             if (t < closest.t) {
                 closest.t = t;
                 closest.triangle = i;
-                closest.object = object;
+                closest.object = o;
             }
         }
     }
     return closest;
 }
 
-// Cosine-weighted hemisphere direction around `normal`, with the same construction as
-// geometry.cuh's cosine_weighted_sampling but in single precision with fast intrinsics.
-template <typename Random>
-__device__ __forceinline__ Vec3 sample_cosine_direction(const Vec3& normal, Random& random) {
-    const float z = 1.0f - 2.0f * random.uniform();
-    const float angle = (2.0f * PI) * random.uniform();
-    const float radius = sqrtf(fmaxf(0.0f, 1.0f - z * z));
-    float sin_angle;
-    float cos_angle;
-    __sincosf(angle, &sin_angle, &cos_angle);
+// One warp per (tile, chunk): each thread traces samples_per_thread of its pixel's paths
+// and adds the result to sums[pixel].
+__global__ void __launch_bounds__(MAX_BLOCK_SIZE)
+render_kernel(RenderSettings settings, const GPUTriangle* __restrict__ triangles,
+              const GPUMaterial* __restrict__ materials, int num_objects, int tiles_x,
+              int num_tiles, int samples_per_thread, int chunks, float* sums) {
+    int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp = thread / 32;
+    int lane = thread % 32;
+    if (warp >= num_tiles * chunks) return;
 
-    const Vec3 direction = normal + Vec3(radius * cos_angle, radius * sin_angle, z);
-    const float length_squared = dot(direction, direction);
-    if (length_squared < EPSILON * EPSILON) return normal;
-    return direction * rsqrtf(length_squared);
-}
+    int tile = warp % num_tiles;
+    int chunk = warp / num_tiles;
+    int x = (tile % tiles_x) * TILE_WIDTH + lane % TILE_WIDTH;
+    int y = (tile / tiles_x) * TILE_HEIGHT + lane / TILE_WIDTH;
+    if (x >= settings.width || y >= settings.height) return;
+    int s = settings.supersampling_factor;
+    int spp = settings.samples_per_pixel;
 
-__global__ void __launch_bounds__(kMaxBlockSize) render_kernel(
-    const RenderSettings settings,
-    const TriangleGPU* __restrict__ triangles,
-    const MaterialGPU* __restrict__ materials,
-    int n_objects,
-    int tiles_x,
-    int n_tiles,
-    int samples_per_thread,
-    int chunks,
-    float* __restrict__ sums
-) {
-    const long long thread = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-    const long long warp = thread / kWarpSize;
-    const int lane = int(thread % kWarpSize);
-    if (warp >= (long long)n_tiles * chunks) return;
-
-    const int tile = int(warp % n_tiles);
-    const int chunk = int(warp / n_tiles);
-    const int x = (tile % tiles_x) * kTileWidth + lane % kTileWidth;
-    const int y = (tile / tiles_x) * kTileHeight + lane / kTileWidth;
-    if (x >= settings.width || y >= settings.height) return;  // partial tiles at the image edge
-
-    const int s = settings.supersampling_factor;
-    const int spp = settings.samples_per_pixel;
-    const int paths = spp * s * s;
-    int k = chunk * samples_per_thread;  // index of the current path within the pixel
-    const int end = min(k + samples_per_thread, paths);
+    // The pixel has s*s*spp paths; path k goes through subpixel k / spp.
+    int k = chunk * samples_per_thread;
+    int end = min(k + samples_per_thread, spp * s * s);
     if (k >= end) return;
 
-    Pcg32 random(mix64((std::uint64_t(settings.seed) << 32) ^ std::uint64_t(thread)), std::uint64_t(thread));
-
-    // Path k belongs to subpixel k / spp; the camera ray is rebuilt only when that changes.
+    Pcg32 random(settings.seed, thread);
     int current_subpixel = k / spp;
     Ray camera_ray = make_camera_ray(settings, x * s + current_subpixel % s, y * s + current_subpixel / s);
 
     Vec3 color;
-    Vec3 origin = camera_ray.origin;
-    Vec3 direction = camera_ray.direction;
+    Ray ray = camera_ray;
     Vec3 throughput(1.0f, 1.0f, 1.0f);
     int depth = 0;
     int last_hit = -1;
 
     while (true) {
-        const HitInfo hit = find_closest_hit(origin, direction, triangles, n_objects, last_hit);
+        Hit hit = find_closest_hit(ray.origin, ray.direction, triangles, num_objects, last_hit);
 
         bool path_done;
         if (hit.triangle < 0) {
             color += multiply(throughput, settings.background_light);
             path_done = true;
         } else {
-            const MaterialGPU& material = materials[hit.object];
-            color += multiply(throughput, xyz(__ldg(&material.emission)));
-            throughput = multiply(throughput, xyz(__ldg(&material.albedo)));
-            path_done = depth >= settings.max_bounces || is_black(throughput);
+            GPUMaterial material = materials[hit.object];
+            color += multiply(throughput, to_vec3(material.emission));
+            throughput = multiply(throughput, to_vec3(material.albedo));
+            path_done = depth >= settings.max_bounces ||
+                        (throughput.x == 0.0f && throughput.y == 0.0f && throughput.z == 0.0f);
             if (!path_done) {
-                const Vec3 normal = facing_normal(triangles + hit.triangle, direction);
-                origin = origin + hit.t * direction;
-                direction = sample_cosine_direction(normal, random);
+                Vec3 normal = triangle_normal(triangles[hit.triangle], ray.direction);
+                ray.origin = ray.origin + hit.t * ray.direction;
+                ray.direction = sample_direction(normal, random);
                 last_hit = hit.triangle;
-                ++depth;
+                depth++;
             }
         }
 
+        // Start the next path.
         if (path_done) {
-            if (++k >= end) break;
-            const int subpixel = k / spp;
+            k++;
+            if (k >= end) break;
+
+            int subpixel = k / spp;
             if (subpixel != current_subpixel) {
                 current_subpixel = subpixel;
                 camera_ray = make_camera_ray(settings, x * s + subpixel % s, y * s + subpixel / s);
             }
-            origin = camera_ray.origin;
-            direction = camera_ray.direction;
+            ray = camera_ray;
             throughput = Vec3(1.0f, 1.0f, 1.0f);
             depth = 0;
             last_hit = -1;
         }
     }
 
-    const int pixel = y * settings.width + x;
+    int pixel = y * settings.width + x;
     atomicAdd(&sums[3 * pixel + 0], color.x);
     atomicAdd(&sums[3 * pixel + 1], color.y);
     atomicAdd(&sums[3 * pixel + 2], color.z);
 }
 
-// Converts per-pixel radiance sums (3 floats per pixel) into tone-mapped pixels.
-__global__ void finalize_kernel(
-    const float* __restrict__ sums,
-    Pixel* __restrict__ pixels,
-    int n_pixels,
-    float paths_per_pixel
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_pixels) return;
-    const Vec3 sum(sums[3 * i], sums[3 * i + 1], sums[3 * i + 2]);
-    pixels[i] = to_pixel(sum / paths_per_pixel);
-}
+// Averages each pixel's sum and converts it to a pixel.
+__global__ void finalize_kernel(const float* sums, Pixel* pixels, int num_pixels, int paths_per_pixel) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_pixels) return;
 
-}  // namespace
+    Vec3 color(sums[3 * i], sums[3 * i + 1], sums[3 * i + 2]);
+    pixels[i] = to_pixel(color / float(paths_per_pixel));
+}
 
 std::vector<Pixel> render_scene(
     const RenderSettings& settings,
     const std::vector<Object>& objects
 ) {
-    if (objects.size() > std::size_t(kMaxObjects)) {
-        throw std::runtime_error("scene has " + std::to_string(objects.size()) +
-                                 " objects; at most " + std::to_string(kMaxObjects) + " are supported");
-    }
-
-    std::vector<TriangleGPU> triangles;
-    std::vector<ObjectGPU> gpu_objects;
-    std::vector<MaterialGPU> materials;
+    std::vector<GPUTriangle> triangles;
+    std::vector<GPUObject> gpu_objects;
+    std::vector<GPUMaterial> materials;
     for (const Object& object : objects) {
-        ObjectGPU record{};
+        GPUObject gpu_object;
         const Sphere& bound = object.bound;
-        record.sphere = make_float4(bound.center.x, bound.center.y, bound.center.z,
-                                    bound.radius * bound.radius);
-        record.tri_begin = int(triangles.size());
-        for (const Triangle& triangle : object.triangles) {
-            const Vec3 e1 = triangle.p1 - triangle.p0;
-            const Vec3 e2 = triangle.p2 - triangle.p0;
-            triangles.push_back(TriangleGPU{
-                make_float4(triangle.p0.x, triangle.p0.y, triangle.p0.z, 0.0f),
-                make_float4(e1.x, e1.y, e1.z, 0.0f),
-                make_float4(e2.x, e2.y, e2.z, 0.0f),
-            });
+        gpu_object.sphere = make_float4(bound.center.x, bound.center.y, bound.center.z,
+                                        bound.radius * bound.radius);
+        gpu_object.tri_begin = triangles.size();
+        for (const Triangle& t : object.triangles) {
+            Vec3 e1 = t.p1 - t.p0;
+            Vec3 e2 = t.p2 - t.p0;
+            GPUTriangle triangle;
+            triangle.p0 = make_float4(t.p0.x, t.p0.y, t.p0.z, 0.0f);
+            triangle.e1 = make_float4(e1.x, e1.y, e1.z, 0.0f);
+            triangle.e2 = make_float4(e2.x, e2.y, e2.z, 0.0f);
+            triangles.push_back(triangle);
         }
-        record.tri_end = int(triangles.size());
-        gpu_objects.push_back(record);
+        gpu_object.tri_end = triangles.size();
+        gpu_objects.push_back(gpu_object);
 
-        materials.push_back(MaterialGPU{
-            make_float4(object.albedo.x, object.albedo.y, object.albedo.z, 0.0f),
-            make_float4(object.emission.x, object.emission.y, object.emission.z, 0.0f),
-        });
+        GPUMaterial material;
+        material.albedo = make_float4(object.albedo.x, object.albedo.y, object.albedo.z, 0.0f);
+        material.emission = make_float4(object.emission.x, object.emission.y, object.emission.z, 0.0f);
+        materials.push_back(material);
     }
+    int num_objects = gpu_objects.size();
+    int num_pixels = settings.width * settings.height;
+    int s = settings.supersampling_factor;
+    int paths_per_pixel = settings.samples_per_pixel * s * s;
 
-    if (!gpu_objects.empty()) {
-        CUDA_CHECK(cudaMemcpyToSymbol(c_objects, gpu_objects.data(), gpu_objects.size() * sizeof(ObjectGPU)));
-    }
-    TriangleGPU* d_triangles = to_device(triangles);
-    MaterialGPU* d_materials = to_device(materials);
+    GPUTriangle* d_triangles;
+    GPUMaterial* d_materials;
+    float* d_sums;
+    Pixel* d_pixels;
+    cudaMalloc(&d_triangles, triangles.size() * sizeof(GPUTriangle));
+    cudaMalloc(&d_materials, num_objects * sizeof(GPUMaterial));
+    cudaMalloc(&d_sums, num_pixels * 3 * sizeof(float));
+    cudaMalloc(&d_pixels, num_pixels * sizeof(Pixel));
+    cudaMemcpy(d_triangles, triangles.data(), triangles.size() * sizeof(GPUTriangle), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_materials, materials.data(), num_objects * sizeof(GPUMaterial), cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(c_objects, gpu_objects.data(), num_objects * sizeof(GPUObject));
+    cudaMemset(d_sums, 0, num_pixels * 3 * sizeof(float));
 
-    const int n_pixels = settings.width * settings.height;
-    const int s = settings.supersampling_factor;
-    const int paths_per_pixel = settings.samples_per_pixel * s * s;
-    float* d_sums = nullptr;
-    Pixel* d_pixels = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_sums, std::size_t(n_pixels) * 3 * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_sums, 0, std::size_t(n_pixels) * 3 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_pixels, std::size_t(n_pixels) * sizeof(Pixel)));
+    // One warp per 8x4 tile of pixels.
+    int tiles_x = (settings.width + TILE_WIDTH - 1) / TILE_WIDTH;
+    int tiles_y = (settings.height + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    int num_tiles = tiles_x * tiles_y;
 
-    const int tiles_x = (settings.width + kTileWidth - 1) / kTileWidth;
-    const int tiles_y = (settings.height + kTileHeight - 1) / kTileHeight;
-    const int n_tiles = tiles_x * tiles_y;
+    // Split each pixel's paths into chunks so that there are about 4 times as many
+    // threads as the GPU can run at once.
+    int num_sms, threads_per_sm;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    cudaDeviceGetAttribute(&threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, 0);
+    int target_threads = 4 * num_sms * threads_per_sm;
+    int chunks = (target_threads + num_tiles * 32 - 1) / (num_tiles * 32);
+    int samples_per_thread = (paths_per_pixel + chunks - 1) / chunks;
 
-    // One warp per tile; choose_launch_shape keeps the block size a multiple of 32,
-    // so warps never straddle blocks.
-    const LaunchShape shape = choose_launch_shape((long long)n_tiles * kWarpSize, paths_per_pixel);
-    const long long threads = (long long)n_tiles * kWarpSize * shape.chunks;
-    const int blocks = int((threads + shape.block_size - 1) / shape.block_size);
-    render_kernel<<<blocks, shape.block_size>>>(
-        settings, d_triangles, d_materials, int(gpu_objects.size()),
-        tiles_x, n_tiles, shape.samples_per_thread, shape.chunks, d_sums);
-    CUDA_CHECK(cudaGetLastError());
+    const char* env = getenv("PT_SAMPLES_PER_THREAD");
+    if (env) samples_per_thread = atoi(env);
+    chunks = (paths_per_pixel + samples_per_thread - 1) / samples_per_thread;
 
-    constexpr int kFinalizeBlock = 256;
-    finalize_kernel<<<(n_pixels + kFinalizeBlock - 1) / kFinalizeBlock, kFinalizeBlock>>>(
-        d_sums, d_pixels, n_pixels, float(paths_per_pixel));
-    CUDA_CHECK(cudaGetLastError());
+    env = getenv("PT_BLOCK_SIZE");
+    int block_size = env ? atoi(env) : 128;
+    int num_threads = num_tiles * 32 * chunks;
+    int num_blocks = (num_threads + block_size - 1) / block_size;
+    render_kernel<<<num_blocks, block_size>>>(settings, d_triangles, d_materials, num_objects,
+                                              tiles_x, num_tiles, samples_per_thread, chunks, d_sums);
+    finalize_kernel<<<(num_pixels + 255) / 256, 256>>>(d_sums, d_pixels, num_pixels, paths_per_pixel);
 
-    std::vector<Pixel> pixels(n_pixels);
-    CUDA_CHECK(cudaMemcpy(pixels.data(), d_pixels, std::size_t(n_pixels) * sizeof(Pixel), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_pixels));
-    CUDA_CHECK(cudaFree(d_sums));
-    CUDA_CHECK(cudaFree(d_materials));
-    CUDA_CHECK(cudaFree(d_triangles));
+    std::vector<Pixel> pixels(num_pixels);
+    cudaMemcpy(pixels.data(), d_pixels, num_pixels * sizeof(Pixel), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_triangles);
+    cudaFree(d_materials);
+    cudaFree(d_sums);
+    cudaFree(d_pixels);
     return pixels;
 }
