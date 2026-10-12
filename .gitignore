@@ -6,6 +6,4 @@ output.ppm
 # sbatch logs and bulky job outputs (CSV results stay tracked for the evidence pack)
 logs/*
 !logs/.gitkeep
-results/**/*.ppm
-results/profile/
 build/
