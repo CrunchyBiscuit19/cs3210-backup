@@ -19,12 +19,6 @@
 #define TILE_WIDTH 8
 #define TILE_HEIGHT 4
 
-struct GPUTriangle {
-    float4 p0;  // xyz = first vertex
-    float4 e1;  // xyz = p1 - p0
-    float4 e2;  // xyz = p2 - p0
-};
-
 // The triangles of all objects are stored in one array, object by object.
 // Object i owns triangles [tri_begin, tri_end).
 struct GPUObject {
@@ -39,9 +33,9 @@ struct GPUMaterial {
 };
 
 struct Hit {
-    float t;
-    int triangle;  // -1 if nothing was hit
-    int object;
+    HitRecord record;
+    int object_index;  // -1 if nothing was hit
+    int triangle_index;
 };
 
 // PCG32 random number generator (pcg-random.org). Each thread uses its own stream.
@@ -90,63 +84,23 @@ __device__ float sphere_entry(Vec3 origin, Vec3 direction, float4 sphere) {
     return fmaxf(-half_b - root, 0.0f);
 }
 
-// Same test as intersect_triangle in geometry.cuh, but only returns t (INF if no hit).
-__device__ float intersect_triangle_t(Vec3 origin, Vec3 direction, const GPUTriangle& triangle) {
-    Vec3 e1 = to_vec3(triangle.e1);
-    Vec3 e2 = to_vec3(triangle.e2);
-    Vec3 p = cross(direction, e2);
-    float det = dot(e1, p);
-    if (fabsf(det) <= EPSILON) return INF;
-
-    float inv_det = 1.0f / det;
-    Vec3 offset = origin - to_vec3(triangle.p0);
-    float u = dot(offset, p) * inv_det;
-    if (u < 0.0f || u > 1.0f) return INF;
-
-    Vec3 q = cross(offset, e1);
-    float v = dot(direction, q) * inv_det;
-    if (v < 0.0f || u + v > 1.0f) return INF;
-
-    float t = dot(e2, q) * inv_det;
-    return t > EPSILON ? t : INF;
-}
-
-// Unit normal of the triangle, facing against the ray (as in intersect_triangle).
-__device__ Vec3 triangle_normal(const GPUTriangle& triangle, Vec3 direction) {
-    Vec3 normal = normalize(cross(to_vec3(triangle.e1), to_vec3(triangle.e2)));
-    if (dot(normal, direction) > 0.0f) normal = -normal;
-    return normal;
-}
-
-// Same as cosine_weighted_sampling in geometry.cuh, in single precision.
-__device__ Vec3 sample_direction(Vec3 normal, Pcg32& random) {
-    float z = 1.0f - 2.0f * random.uniform();
-    float angle = 2.0f * PI * random.uniform();
-    float radius = sqrtf(1.0f - z * z);
-    float sin_angle, cos_angle;
-    sincosf(angle, &sin_angle, &cos_angle);
-
-    Vec3 direction = normal + Vec3(radius * cos_angle, radius * sin_angle, z);
-    if (dot(direction, direction) < EPSILON * EPSILON) return normal;
-    return normalize(direction);
-}
-
-__device__ Hit find_closest_hit(Vec3 origin, Vec3 direction, const GPUTriangle* triangles,
-                                int num_objects, int last_hit) {
-    Hit closest = {INF, -1, -1};
+__device__ Hit find_closest_hit(const Ray& ray, const Triangle* triangles, int num_objects, int last_hit) {
+    Hit closest;
+    closest.object_index = -1;
+    closest.triangle_index = -1;
 
     for (int o = 0; o < num_objects; o++) {
         // Skip the object if the ray misses its bounding sphere, or only reaches it
         // further away than the closest hit so far.
-        if (sphere_entry(origin, direction, c_objects[o].sphere) >= closest.t) continue;
+        if (sphere_entry(ray.origin, ray.direction, c_objects[o].sphere) >= closest.record.t) continue;
 
         for (int i = c_objects[o].tri_begin; i < c_objects[o].tri_end; i++) {
             if (i == last_hit) continue;
-            float t = intersect_triangle_t(origin, direction, triangles[i]);
-            if (t < closest.t) {
-                closest.t = t;
-                closest.triangle = i;
-                closest.object = o;
+            HitRecord record;
+            if (intersect_triangle(ray, triangles[i], &record) && record.t < closest.record.t) {
+                closest.record = record;
+                closest.object_index = o;
+                closest.triangle_index = i;
             }
         }
     }
@@ -156,7 +110,7 @@ __device__ Hit find_closest_hit(Vec3 origin, Vec3 direction, const GPUTriangle* 
 // One warp per (tile, chunk): each thread traces samples_per_thread of its pixel's paths
 // and adds the result to sums[pixel].
 __global__ void __launch_bounds__(MAX_BLOCK_SIZE)
-render_kernel(RenderSettings settings, const GPUTriangle* __restrict__ triangles,
+render_kernel(RenderSettings settings, const Triangle* __restrict__ triangles,
               const GPUMaterial* __restrict__ materials, int num_objects, int tiles_x,
               int num_tiles, int samples_per_thread, int chunks, float* sums) {
     int thread = blockIdx.x * blockDim.x + threadIdx.x;
@@ -188,23 +142,21 @@ render_kernel(RenderSettings settings, const GPUTriangle* __restrict__ triangles
     int last_hit = -1;
 
     while (true) {
-        Hit hit = find_closest_hit(ray.origin, ray.direction, triangles, num_objects, last_hit);
+        Hit hit = find_closest_hit(ray, triangles, num_objects, last_hit);
 
         bool path_done;
-        if (hit.triangle < 0) {
+        if (hit.object_index < 0) {
             color += multiply(throughput, settings.background_light);
             path_done = true;
         } else {
-            GPUMaterial material = materials[hit.object];
+            GPUMaterial material = materials[hit.object_index];
             color += multiply(throughput, to_vec3(material.emission));
             throughput = multiply(throughput, to_vec3(material.albedo));
             path_done = depth >= settings.max_bounces ||
                         (throughput.x == 0.0f && throughput.y == 0.0f && throughput.z == 0.0f);
             if (!path_done) {
-                Vec3 normal = triangle_normal(triangles[hit.triangle], ray.direction);
-                ray.origin = ray.origin + hit.t * ray.direction;
-                ray.direction = sample_direction(normal, random);
-                last_hit = hit.triangle;
+                ray = cosine_weighted_sampling(hit.record, random);
+                last_hit = hit.triangle_index;
                 depth++;
             }
         }
@@ -245,7 +197,7 @@ std::vector<Pixel> render_scene(
     const RenderSettings& settings,
     const std::vector<Object>& objects
 ) {
-    std::vector<GPUTriangle> triangles;
+    std::vector<Triangle> triangles;
     std::vector<GPUObject> gpu_objects;
     std::vector<GPUMaterial> materials;
     for (const Object& object : objects) {
@@ -254,15 +206,7 @@ std::vector<Pixel> render_scene(
         gpu_object.sphere = make_float4(bound.center.x, bound.center.y, bound.center.z,
                                         bound.radius * bound.radius);
         gpu_object.tri_begin = triangles.size();
-        for (const Triangle& t : object.triangles) {
-            Vec3 e1 = t.p1 - t.p0;
-            Vec3 e2 = t.p2 - t.p0;
-            GPUTriangle triangle;
-            triangle.p0 = make_float4(t.p0.x, t.p0.y, t.p0.z, 0.0f);
-            triangle.e1 = make_float4(e1.x, e1.y, e1.z, 0.0f);
-            triangle.e2 = make_float4(e2.x, e2.y, e2.z, 0.0f);
-            triangles.push_back(triangle);
-        }
+        triangles.insert(triangles.end(), object.triangles.begin(), object.triangles.end());
         gpu_object.tri_end = triangles.size();
         gpu_objects.push_back(gpu_object);
 
@@ -276,15 +220,15 @@ std::vector<Pixel> render_scene(
     int s = settings.supersampling_factor;
     int paths_per_pixel = settings.samples_per_pixel * s * s;
 
-    GPUTriangle* d_triangles;
+    Triangle* d_triangles;
     GPUMaterial* d_materials;
     float* d_sums;
     Pixel* d_pixels;
-    cudaMalloc(&d_triangles, triangles.size() * sizeof(GPUTriangle));
+    cudaMalloc(&d_triangles, triangles.size() * sizeof(Triangle));
     cudaMalloc(&d_materials, num_objects * sizeof(GPUMaterial));
     cudaMalloc(&d_sums, num_pixels * 3 * sizeof(float));
     cudaMalloc(&d_pixels, num_pixels * sizeof(Pixel));
-    cudaMemcpy(d_triangles, triangles.data(), triangles.size() * sizeof(GPUTriangle), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_triangles, triangles.data(), triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
     cudaMemcpy(d_materials, materials.data(), num_objects * sizeof(GPUMaterial), cudaMemcpyHostToDevice);
     cudaMemcpyToSymbol(c_objects, gpu_objects.data(), num_objects * sizeof(GPUObject));
     cudaMemset(d_sums, 0, num_pixels * 3 * sizeof(float));

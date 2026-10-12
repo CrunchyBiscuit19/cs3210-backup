@@ -1,13 +1,8 @@
-// v1: v0 + bounding sphere culling.
-// Skip all triangles of an object when the ray misses its bounding sphere.
-
 #include <vector>
 
 #include "graphics.cuh"
 #include "geometry.cuh"
 
-// The triangles of all objects are stored in one array, object by object.
-// Object i owns triangles [tri_begin, tri_end).
 struct GPUObject {
     Sphere bound;
     Vec3 albedo;
@@ -44,8 +39,6 @@ __device__ Hit find_closest_hit(const Ray& ray, const Triangle* triangles, const
     return closest;
 }
 
-// Same as trace_ray in cpu_path_tracing.cu, but as a loop instead of recursion.
-// throughput is the product of the albedos of the surfaces hit so far.
 __device__ Vec3 trace_path(Ray ray, const RenderSettings& settings, const Triangle* triangles,
                            const GPUObject* objects, int num_objects, RandomGPU& random) {
     Vec3 color;
@@ -70,7 +63,6 @@ __device__ Vec3 trace_path(Ray ray, const RenderSettings& settings, const Triang
     return color;
 }
 
-// One thread per output pixel.
 __global__ void render_kernel(RenderSettings settings, const Triangle* triangles,
                               const GPUObject* objects, int num_objects, Pixel* pixels) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
