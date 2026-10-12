@@ -18,7 +18,8 @@ if ! command -v nvcc >/dev/null 2>&1 && [[ -d /usr/local/cuda/bin ]]; then
 fi
 
 JOB_ID="${SLURM_JOB_ID:-local$$}"
-RESULTS_DIR="$ROOT/results"
+# Where CSVs, images and profiles go. Override with e.g. RESULTS_DIR=results/a100 (relative to the repo root).
+RESULTS_DIR="${RESULTS_DIR:-$ROOT/results}"
 mkdir -p "$RESULTS_DIR" "$ROOT/logs"
 
 DEBUG_SCENES=(scenes/debug/*.rtscene)
@@ -44,17 +45,26 @@ print_env() {
     echo "== nvcc: $(nvcc --version 2>/dev/null | tail -n1)"
 }
 
-# Builds ./path_tracing and every versions/v*.cu into build/ unless SKIP_BUILD=1.
+# build <impl>...: builds only the executables of the given implementations
+# (e.g. path_tracing, v2_ray_cost) unless SKIP_BUILD=1. The benchmarks are prebuilt.
 # make -k keeps going past a version that fails to compile; runs of a missing
 # executable are reported as CRASH(127) instead of aborting the whole job.
 build() {
+    chmod +x benchmarks/bench_* 2>/dev/null
     if [[ "${SKIP_BUILD:-0}" == 1 ]]; then
         echo "== SKIP_BUILD=1, using existing executables"
-    else
-        echo "== make path_tracing versions"
-        make -k path_tracing versions || echo "warning: some targets failed to build" >&2
+        return
     fi
-    chmod +x benchmarks/bench_* 2>/dev/null
+
+    local targets=()
+    local impl
+    for impl in "$@"; do
+        [[ "$impl" == bench_* ]] || targets+=("$(impl_path "$impl" | sed 's|^\./||')")
+    done
+    if (( ${#targets[@]} > 0 )); then
+        echo "== make ${targets[*]}"
+        make -k "${targets[@]}" || echo "warning: some targets failed to build" >&2
+    fi
 }
 
 # Exits if an executable needed by the job is missing.

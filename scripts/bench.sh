@@ -34,7 +34,7 @@ runs=${RUNS:-3}
 read -ra impls <<<"${IMPLS:-$ALL_IMPLS}"
 
 print_env
-build
+build "${impls[@]}"
 
 csv="$RESULTS_DIR/bench-$(gpu_tag)-$JOB_ID.csv"
 img_dir="$RESULTS_DIR/bench-$JOB_ID"

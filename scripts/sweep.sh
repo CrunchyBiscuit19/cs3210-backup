@@ -51,7 +51,7 @@ if [[ " $template" != *" --"* ]]; then
 fi
 
 print_env
-build
+build "${impls[@]}"
 
 csv="$RESULTS_DIR/sweep-$name-$(gpu_tag)-$JOB_ID.csv"
 img_dir="$RESULTS_DIR/sweep-$JOB_ID"

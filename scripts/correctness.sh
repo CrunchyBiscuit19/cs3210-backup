@@ -32,7 +32,7 @@ fi
 read -ra impls <<<"${IMPLS:-path_tracing}"
 
 print_env
-build
+build "${impls[@]}"
 for impl in "${impls[@]}"; do
     require_exe "$(impl_path "$impl")"
 done

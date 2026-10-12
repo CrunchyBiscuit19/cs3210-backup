@@ -39,7 +39,7 @@ impl=${IMPL:-path_tracing}
 exe=$(impl_path "$impl")
 
 print_env
-build
+build "$impl"
 require_exe "$exe"
 
 prof_dir="$RESULTS_DIR/profile"
