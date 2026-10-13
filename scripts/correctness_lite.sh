@@ -11,7 +11,7 @@
 #
 # Usage (from the repo root):
 #   sbatch scripts/correctness_lite.sh
-#   IMPLS="v3_occupancy v4_coherence" sbatch scripts/correctness_lite.sh
+#   IMPLS="v3Occupancy v4Coherence" sbatch scripts/correctness_lite.sh
 #   sbatch --gpus=h100-96 --constraint=xgpi scripts/correctness_lite.sh
 #
 # Takes the same environment variables as correctness.sh

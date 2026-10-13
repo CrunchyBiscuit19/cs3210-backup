@@ -17,7 +17,7 @@
 #   sbatch scripts/bench.sh
 #   sbatch --gpus=h100-96 --constraint=xgpi scripts/bench.sh
 #   RUNS=5 IMPLS="path_tracing bench_4" sbatch scripts/bench.sh scenes/dragon.rtscene
-#   IMPLS="v1_culling v2_ray_cost v3_occupancy v4_coherence bench_4" sbatch scripts/bench.sh
+#   IMPLS="v1Culling v2RayCost v3Occupancy v4Coherence bench_4" sbatch scripts/bench.sh
 #
 # Env: RUNS (default 3), IMPLS (default: path_tracing and all five benchmarks;
 #      v*_name runs build/<name> from versions/),

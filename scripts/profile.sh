@@ -16,7 +16,7 @@
 #   sbatch scripts/profile.sh scenes/cornell_box.rtscene
 #   TOOL=ncu sbatch scripts/profile.sh scenes/dragon.rtscene --samples_per_pixel 64
 #   TOOL=both sbatch --gpus=h100-96 --constraint=xgpi scripts/profile.sh scenes/ufo.rtscene
-#   IMPL=v0_naive TOOL=ncu sbatch scripts/profile.sh scenes/cornell_box.rtscene --samples_per_pixel 16
+#   IMPL=v0Naive TOOL=ncu sbatch scripts/profile.sh scenes/cornell_box.rtscene --samples_per_pixel 16
 #
 # Env: IMPL     implementation name, as in bench.sh (default path_tracing)
 #      TOOL=nsys|ncu|both (default nsys)

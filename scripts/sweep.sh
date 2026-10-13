@@ -10,7 +10,7 @@
 # Measures how runtime scales with one parameter, for the evidence pack's
 # "how do input factors / CUDA parameters affect runtime" questions. Each value
 # replaces {} in the template. Template tokens of the form NAME=... are exported
-# as environment variables (the PT_* tuning knobs read by v3 and later);
+# as environment variables (the PT_* tuning knobs read by path_tracing.cu);
 # all other tokens are passed to the executable as flags.
 #
 # If the template has no -- flags, the render settings are unchanged, so every run
@@ -23,8 +23,8 @@
 #   sbatch scripts/sweep.sh scenes/cornell_box.rtscene "--samples_per_pixel {}" 100 1000 10000
 #   sbatch scripts/sweep.sh scenes/dragon.rtscene "--width {} --height {}" 128 256 512 1024
 #   sbatch scripts/sweep.sh scenes/ufo.rtscene "--max_bounces {}" 0 1 2 3 4 5
-#   IMPLS=v4_coherence sbatch scripts/sweep.sh scenes/dragon.rtscene "PT_BLOCK_SIZE={}" 32 64 128 256 512
-#   IMPLS=v4_coherence sbatch scripts/sweep.sh scenes/ufo.rtscene "PT_SAMPLES_PER_THREAD={}" 16 64 256 1024
+#   sbatch scripts/sweep.sh scenes/dragon.rtscene "PT_BLOCK_SIZE={}" 32 64 128 256 512
+#   sbatch scripts/sweep.sh scenes/ufo.rtscene "PT_SAMPLES_PER_THREAD={}" 16 64 256 1024
 #   IMPLS="path_tracing bench_4" sbatch scripts/sweep.sh ...   # compare scaling with a benchmark
 #
 # Env: RUNS (default 3), IMPLS (default "path_tracing"), SKIP_BUILD=1, RUN_TIMEOUT=<s>.

@@ -46,7 +46,7 @@ print_env() {
 }
 
 # build <impl>...: builds only the executables of the given implementations
-# (e.g. path_tracing, v2_ray_cost) unless SKIP_BUILD=1. The benchmarks are prebuilt.
+# (e.g. path_tracing, v2RayCost) unless SKIP_BUILD=1. The benchmarks are prebuilt.
 # make -k keeps going past a version that fails to compile; runs of a missing
 # executable are reported as CRASH(127) instead of aborting the whole job.
 build() {
@@ -76,7 +76,7 @@ require_exe() {
 }
 
 # Maps an implementation name to its executable:
-#   path_tracing -> ./path_tracing, bench_N -> ./benchmarks/bench_N, v2_ray_cost -> ./build/v2_ray_cost
+#   path_tracing -> ./path_tracing, bench_N -> ./benchmarks/bench_N, v2RayCost -> ./build/v2RayCost
 impl_path() {
     case "$1" in
         path_tracing) echo ./path_tracing ;;

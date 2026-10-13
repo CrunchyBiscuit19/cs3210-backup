@@ -15,11 +15,11 @@
 #   sbatch scripts/correctness.sh                               # ./path_tracing, debug + main scenes, A100
 #   sbatch --gpus=h100-96 --constraint=xgpi scripts/correctness.sh
 #   sbatch scripts/correctness.sh scenes/debug/*.rtscene        # chosen scenes only
-#   IMPLS="v0_naive v1_culling" sbatch scripts/correctness.sh   # versions from versions/
+#   IMPLS="v0Naive v1Culling" sbatch scripts/correctness.sh   # versions from versions/
 #
 # Env: IMPLS (default "path_tracing"; also v*_name for build/<name>, bench_N),
 #      SKIP_BUILD=1 reuses existing executables, RUN_TIMEOUT=<s> per run (default 900).
-# v0_naive is slow on the large scenes; raise --time if you check it on all of them.
+# v0Naive is slow on the large scenes; raise --time if you check it on all of them.
 # Rendered images go to results/correctness-<job>/, the log to logs/.
 
 source "${SLURM_SUBMIT_DIR:-$PWD}/scripts/common.sh"

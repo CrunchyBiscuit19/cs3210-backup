@@ -7,7 +7,6 @@
 // PT_BLOCK_SIZE and PT_SAMPLES_PER_THREAD override the defaults (for parameter sweeps).
 // PT_BLOCK_SIZE should be a multiple of 32 so that every warp covers exactly one tile.
 
-#include <cstdint>
 #include <cstdlib>
 #include <vector>
 
@@ -36,33 +35,6 @@ struct Hit {
     HitRecord record;
     int object_index;  // -1 if nothing was hit
     int triangle_index;
-};
-
-// PCG32 random number generator (pcg-random.org). Each thread uses its own stream.
-struct Pcg32 {
-    uint64_t state;
-    uint64_t inc;
-
-    __device__ Pcg32(uint64_t seed, uint64_t stream) {
-        state = 0;
-        inc = (stream << 1) | 1;
-        next();
-        state += seed;
-        next();
-    }
-
-    __device__ uint32_t next() {
-        uint64_t old = state;
-        state = old * 6364136223846793005ULL + inc;
-        uint32_t xorshifted = ((old >> 18) ^ old) >> 27;
-        uint32_t rot = old >> 59;
-        return (xorshifted >> rot) | (xorshifted << ((-rot) & 31));
-    }
-
-    // Uniform float in [0, 1).
-    __device__ float uniform() {
-        return (next() >> 8) * (1.0f / 16777216.0f);
-    }
 };
 
 __constant__ GPUObject c_objects[MAX_OBJECTS];
@@ -131,7 +103,7 @@ render_kernel(RenderSettings settings, const Triangle* __restrict__ triangles,
     int end = min(k + samples_per_thread, spp * s * s);
     if (k >= end) return;
 
-    Pcg32 random(settings.seed, thread);
+    RandomGPU random(settings.seed + thread);
     int current_subpixel = k / spp;
     Ray camera_ray = make_camera_ray(settings, x * s + current_subpixel % s, y * s + current_subpixel / s);
 
